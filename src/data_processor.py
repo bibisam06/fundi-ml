@@ -45,6 +45,18 @@ def load_raw_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     return funding_df, kline_df
 
 
+def load_open_interest_data() -> pd.DataFrame | None:
+    """Open Interest raw CSV가 있으면 로드한다."""
+    oi_path = RAW_DIR / "btcusdt_open_interest_hist.csv"
+    if not oi_path.exists():
+        log.info("[로드] open interest 파일 없음 - OI 병합은 건너뜀")
+        return None
+
+    oi_df = pd.read_csv(oi_path)
+    log.info(f"[로드] open interest: {len(oi_df):,}행")
+    return oi_df
+
+
 # ──────────────────────────────────────────────────────────────
 # 2. 전처리
 # ──────────────────────────────────────────────────────────────
@@ -132,6 +144,40 @@ def preprocess_kline_data(kline_df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def preprocess_open_interest_data(oi_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Open Interest 전처리:
+      - timestamp를 time으로 통일
+      - 숫자형 변환
+      - 중복 제거 및 정렬
+    """
+    df = oi_df.copy()
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
+    df["timestamp"] = df["timestamp"].dt.floor("h")
+    df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"], errors="coerce")
+    df["sumOpenInterestValue"] = pd.to_numeric(df["sumOpenInterestValue"], errors="coerce")
+
+    df = df.rename(
+        columns={
+            "timestamp": "time",
+            "sumOpenInterest": "open_interest",
+            "sumOpenInterestValue": "open_interest_value",
+        }
+    )
+
+    keep_cols = [col for col in ["time", "symbol", "open_interest", "open_interest_value"] if col in df.columns]
+    df = df[keep_cols]
+    df = (
+        df.drop_duplicates(subset=["time"])
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    log.info(f"[Open Interest] 전처리 완료: {len(df):,}행")
+    return df
+
+
 # ──────────────────────────────────────────────────────────────
 # 3. 병합
 # ──────────────────────────────────────────────────────────────
@@ -173,6 +219,27 @@ def merge_asof_funding(
     return df
 
 
+def merge_asof_open_interest(
+    base_df: pd.DataFrame,
+    oi_df: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """
+    1시간봉 데이터에 Open Interest를 asof로 병합한다.
+    OI는 최근 약 30일만 존재할 수 있으므로, 없는 구간은 NaN으로 둔다.
+    """
+    if oi_df is None or oi_df.empty:
+        return base_df
+
+    left = base_df.sort_values("time").copy()
+    right = oi_df.sort_values("time").copy()
+    if "symbol" in right.columns:
+        right = right.drop(columns=["symbol"])
+
+    df = pd.merge_asof(left, right, on="time", direction="backward")
+    log.info(f"[Asof Merge] open interest 병합 완료: {len(df):,}행")
+    return df
+
+
 # ──────────────────────────────────────────────────────────────
 # 4. 파생변수
 # ──────────────────────────────────────────────────────────────
@@ -193,6 +260,13 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
     if "funding_rate" in result.columns:
         result["funding_rate_diff"] = result["funding_rate"].diff()
         result["funding_rate_ma3"] = result["funding_rate"].rolling(3).mean()
+
+    if "open_interest" in result.columns:
+        result["open_interest_diff"] = result["open_interest"].diff()
+        result["open_interest_pct_change"] = result["open_interest"].pct_change()
+
+    if {"open_interest", "volume"}.issubset(result.columns):
+        result["oi_volume_ratio"] = result["open_interest"] / result["volume"].replace(0, pd.NA)
 
     return result
 
@@ -240,19 +314,24 @@ def main() -> None:
 
     # 로드
     funding_df, kline_df = load_raw_data()
+    oi_df = load_open_interest_data()
 
     # 전처리
     funding_df = preprocess_funding_data(funding_df)
     kline_df = preprocess_kline_data(kline_df)
+    if oi_df is not None:
+        oi_df = preprocess_open_interest_data(oi_df)
 
     # 병합 1: funding 이벤트 시점만
     event_df = merge_funding_events(funding_df, kline_df)
+    event_df = merge_asof_open_interest(event_df, oi_df)
     event_df = add_features(event_df)
     save_data(event_df, "btcusdt_funding_event_merged.csv")
     validate(event_df, "Funding Event Merged (8h 기준)")
 
     # 병합 2: 1h 전체 + asof funding (메인 분석용)
     asof_df = merge_asof_funding(kline_df, funding_df)
+    asof_df = merge_asof_open_interest(asof_df, oi_df)
     asof_df = add_features(asof_df)
     save_data(asof_df, "btcusdt_1h_with_funding.csv")
     validate(asof_df, "1h Full + Asof Funding (메인 분석용)")

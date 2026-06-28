@@ -33,11 +33,16 @@ def load_dataset(path: Path = INPUT_PATH) -> pd.DataFrame:
     numeric_cols = [
         "close",
         "funding_rate",
+        "open_interest",
+        "open_interest_value",
         "future_return_1h",
         "future_return_4h",
         "future_return_8h",
         "funding_rate_diff",
         "funding_rate_ma3",
+        "open_interest_diff",
+        "open_interest_pct_change",
+        "oi_volume_ratio",
     ]
     for col in numeric_cols:
         if col in df.columns:
@@ -69,6 +74,22 @@ def add_common_features(df: pd.DataFrame) -> pd.DataFrame:
         ],
         default="bear_low_vol",
     )
+
+    if "open_interest_pct_change" in result.columns:
+        oi_threshold = result["open_interest_pct_change"].abs().median()
+        result["oi_regime"] = np.select(
+            [
+                result["open_interest_pct_change"] >= oi_threshold,
+                result["open_interest_pct_change"] <= -oi_threshold,
+            ],
+            [
+                "oi_rising",
+                "oi_falling",
+            ],
+            default="oi_stable",
+        )
+    else:
+        result["oi_regime"] = "oi_unavailable"
     return result
 
 
@@ -138,10 +159,17 @@ def summarise_method(df: pd.DataFrame) -> dict[str, object]:
             "avg_future_return_4h_neg_extreme": np.nan,
             "best_regime": np.nan,
             "best_regime_accuracy": np.nan,
+            "best_oi_regime": np.nan,
+            "best_oi_regime_accuracy": np.nan,
         }
 
     regime_scores = (
         events.groupby("regime")["direction_correct"]
+        .mean()
+        .sort_values(ascending=False)
+    )
+    oi_regime_scores = (
+        events.groupby("oi_regime")["direction_correct"]
         .mean()
         .sort_values(ascending=False)
     )
@@ -157,6 +185,8 @@ def summarise_method(df: pd.DataFrame) -> dict[str, object]:
         "avg_future_return_4h_neg_extreme": float(neg_events["future_return_4h"].mean()) if not neg_events.empty else np.nan,
         "best_regime": regime_scores.index[0] if not regime_scores.empty else np.nan,
         "best_regime_accuracy": float(regime_scores.iloc[0]) if not regime_scores.empty else np.nan,
+        "best_oi_regime": oi_regime_scores.index[0] if not oi_regime_scores.empty else np.nan,
+        "best_oi_regime_accuracy": float(oi_regime_scores.iloc[0]) if not oi_regime_scores.empty else np.nan,
     }
 
 
